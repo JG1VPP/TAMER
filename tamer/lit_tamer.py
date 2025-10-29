@@ -1,0 +1,193 @@
+from typing import List
+
+import pytorch_lightning as pl
+import torch.optim as optim
+from torch import FloatTensor, LongTensor
+
+from tamer.datamodule import Batch, vocab
+from tamer.model.tamer import TAMER
+from tamer.utils.utils import (
+    CERRecorder,
+    ExpRateRecorder,
+    Hypothesis,
+    ce_loss,
+    to_bi_tgt_out,
+    to_struct_output,
+)
+
+
+class LitTAMER(pl.LightningModule):
+    def __init__(
+        self,
+        d_model: int,
+        # encoder
+        growth_rate: int,
+        num_layers: int,
+        # decoder
+        nhead: int,
+        num_decoder_layers: int,
+        dim_feedforward: int,
+        dropout: float,
+        dc: int,
+        cross_coverage: bool,
+        self_coverage: bool,
+        # beam search
+        beam_size: int,
+        max_len: int,
+        alpha: float,
+        early_stopping: bool,
+        temperature: float,
+        # training
+        learning_rate: float,
+        patience: int,
+        milestones: List[int] = [40, 55],
+        vocab_size: int = 113,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.tamer_model = TAMER(
+            d_model=d_model,
+            growth_rate=growth_rate,
+            num_layers=num_layers,
+            nhead=nhead,
+            num_decoder_layers=num_decoder_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            dc=dc,
+            cross_coverage=cross_coverage,
+            self_coverage=self_coverage,
+            vocab_size=vocab_size,
+        )
+
+        self.cer_recorder = CERRecorder()
+        self.exprate_recorder = ExpRateRecorder()
+
+    def forward(
+        self, img: FloatTensor, img_mask: LongTensor, tgt: LongTensor
+    ) -> FloatTensor:
+        """run img and bi-tgt
+
+        Parameters
+        ----------
+        img : FloatTensor
+            [b, 1, h, w]
+        img_mask: LongTensor
+            [b, h, w]
+        tgt : LongTensor
+            [2b, l]
+
+        Returns
+        -------
+        FloatTensor
+            [2b, l, vocab_size]
+        """
+        return self.tamer_model(img, img_mask, tgt)
+
+    def training_step(self, batch: Batch, _):
+        tgt, out = to_bi_tgt_out(batch.indices, self.device)
+        struct_out, _ = to_struct_output(batch.indices, self.device)
+        out_hat, sim = self(batch.imgs, batch.mask, tgt)
+
+        loss = ce_loss(out_hat, out)
+        self.log("train_loss", loss, on_step=False, on_epoch=True, sync_dist=True)
+        struct_loss = ce_loss(sim, struct_out, ignore_idx=-1)
+        self.log(
+            "train/struct_loss",
+            struct_loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=len(batch.imgs),
+        )
+
+        return loss + struct_loss
+
+    def validation_step(self, batch: Batch, _):
+        tgt, out = to_bi_tgt_out(batch.indices, self.device)
+        struct_out, _ = to_struct_output(batch.indices, self.device)
+        out_hat, sim = self(batch.imgs, batch.mask, tgt)
+
+        loss = ce_loss(out_hat, out)
+        self.log(
+            "val_loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+            batch_size=len(batch.imgs),
+        )
+        struct_loss = ce_loss(sim, struct_out, ignore_idx=-1)
+        self.log(
+            "val/struct_loss",
+            struct_loss,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            sync_dist=True,
+            batch_size=len(batch.imgs),
+        )
+
+        hyps = self.approximate_joint_search(batch.imgs, batch.mask)
+
+        self.exprate_recorder([h.seq for h in hyps], batch.indices)
+        self.log(
+            "val_ExpRate",
+            self.exprate_recorder,
+            prog_bar=True,
+            on_step=False,
+            on_epoch=True,
+            batch_size=len(batch.imgs),
+        )
+
+    def test_step(self, batch: Batch, _):
+        hyps = self.approximate_joint_search(batch.imgs, batch.mask)
+        self.cer_recorder([h.seq for h in hyps], batch.indices)
+        self.exprate_recorder([h.seq for h in hyps], batch.indices)
+
+    def predict_step(self, batch: Batch, _):
+        hyps = self.approximate_joint_search(batch.imgs, batch.mask)
+        self.cer_recorder([h.seq for h in hyps], batch.indices)
+        self.exprate_recorder([h.seq for h in hyps], batch.indices)
+
+        results = []
+
+        for hyp, idx, name in zip(hyps, batch.indices, batch.img_bases):
+            output = vocab.indices2label(hyp.seq)
+            target = vocab.indices2label(idx)
+
+            output = dict(tex=output)
+            target = dict(tex=target, name=name)
+            sample = dict(outputs=output, targets=target)
+
+            results.append(sample)
+
+        return results
+
+    def on_test_epoch_end(self) -> None:
+        self.cer = float(self.cer_recorder.compute())
+        self.exp_rate = float(self.exprate_recorder.compute())
+
+    def on_predict_epoch_end(self) -> None:
+        self.cer = float(self.cer_recorder.compute())
+        self.exp_rate = float(self.exprate_recorder.compute())
+
+    def approximate_joint_search(
+        self, img: FloatTensor, mask: LongTensor
+    ) -> List[Hypothesis]:
+        return self.tamer_model.beam_search(img, mask, **self.hparams)
+
+    def configure_optimizers(self):
+        optimizer = optim.Adadelta(
+            self.parameters(),
+            lr=self.hparams.learning_rate,
+            eps=1e-6,
+            weight_decay=1e-4,
+        )
+
+        scheduler = optim.lr_scheduler.MultiStepLR(
+            optimizer, milestones=self.hparams.milestones, gamma=0.1
+        )
+
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}
